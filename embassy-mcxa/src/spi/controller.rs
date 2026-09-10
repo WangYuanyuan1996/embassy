@@ -281,18 +281,24 @@ impl<'d, M: IoMode> Spi<'d, M> {
         }
 
         self.info.regs().tcr().modify(|w| {
-            w.set_txmsk(Txmsk::Mask);
+            w.set_txmsk(Txmsk::Normal);
             w.set_rxmsk(Rxmsk::Normal);
         });
 
+        let fifo_size = LPSPI_FIFO_SIZE;
+
         for word in data {
+            while self.info.regs().fsr().read().txcount() - fifo_size == 0 {}
+            self.check_status()?;
+            self.info.regs().tdr().write(|w| w.set_data(0));
+
             // Wait until we have data in the RxFIFO.
             while self.info.regs().fsr().read().rxcount() == 0 {}
             self.check_status()?;
             *word = self.info.regs().rdr().read().data() as u8;
         }
 
-        Ok(())
+        self.blocking_flush()
     }
 
     /// Write data to Spi blocking execution until done.
@@ -347,11 +353,15 @@ impl<'d, M: IoMode> Spi<'d, M> {
 
         if read_remaining > 0 {
             self.info.regs().tcr().modify(|w| {
-                w.set_txmsk(Txmsk::Mask);
+                w.set_txmsk(Txmsk::Normal);
                 w.set_rxmsk(Rxmsk::Normal);
             });
 
             for rb in read.iter_mut().skip(common) {
+                while self.info.regs().fsr().read().txcount() - fifo_size == 0 {}
+                self.check_status()?;
+                self.info.regs().tdr().write(|w| w.set_data(0));
+
                 while self.info.regs().fsr().read().rxcount() == 0 {}
                 self.check_status()?;
                 *rb = self.info.regs().rdr().read().data() as u8;
@@ -990,13 +1000,28 @@ impl<'d> AsyncEngine for Spi<'d, Async> {
 
         let info = self.info;
         let on_drop = OnDrop::new(move || Self::abort_async_transaction(info));
-
         self.info.regs().tcr().modify(|w| {
-            w.set_txmsk(Txmsk::Mask);
+            w.set_txmsk(Txmsk::Normal);
             w.set_rxmsk(Rxmsk::Normal);
         });
 
         for word in data {
+            self.info
+                .wait_cell()
+                .wait_for(|| {
+                    self.info.regs().ier().modify(|w| {
+                        w.set_tdie(true);
+                        w.set_teie(true);
+                        w.set_reie(true);
+                    });
+                    let status = self.info.regs().sr().read();
+                    self.info.regs().fsr().read().txcount() < LPSPI_FIFO_SIZE || status.tef() || status.ref_()
+                })
+                .await
+                .map_err(|_| IoError::Other)?;
+            self.check_status()?;
+            self.info.regs().tdr().write(|w| w.set_data(0));
+
             // Wait until we have data in the RxFIFO.
             self.info
                 .wait_cell()
@@ -1112,11 +1137,27 @@ impl<'d> AsyncEngine for Spi<'d, Async> {
 
         if read_remaining > 0 {
             self.info.regs().tcr().modify(|w| {
-                w.set_txmsk(Txmsk::Mask);
+                w.set_txmsk(Txmsk::Normal);
                 w.set_rxmsk(Rxmsk::Normal);
             });
 
             for rb in read.iter_mut().skip(common) {
+                self.info
+                    .wait_cell()
+                    .wait_for(|| {
+                        self.info.regs().ier().modify(|w| {
+                            w.set_tdie(true);
+                            w.set_teie(true);
+                            w.set_reie(true);
+                        });
+                        let status = self.info.regs().sr().read();
+                        self.info.regs().fsr().read().txcount() < LPSPI_FIFO_SIZE || status.tef() || status.ref_()
+                    })
+                    .await
+                    .map_err(|_| IoError::Other)?;
+                self.check_status()?;
+                self.info.regs().tdr().write(|w| w.set_data(0));
+
                 self.info
                     .wait_cell()
                     .wait_for(|| {
@@ -1273,20 +1314,44 @@ impl<'d> AsyncEngine for Spi<'d, Dma<'d>> {
             return Ok(());
         }
 
+        let on_drop = OnDrop::new(|| {
+            self.info.regs().der().modify(|w| w.set_tdde(false));
+        });
+
+        let common = read.len().min(write.len());
+        let (read_common, read_tail) = read.split_at_mut(common);
+        let (write_common, write_tail) = write.split_at(common);
+
         self.info.regs().tcr().modify(|w| {
             w.set_txmsk(Txmsk::Normal);
             w.set_rxmsk(Rxmsk::Normal);
         });
 
-        let on_drop = OnDrop::new(|| {
-            self.info.regs().der().modify(|w| w.set_tdde(false));
-        });
-
-        for (read_chunk, write_chunk) in read
+        for (read_chunk, write_chunk) in read_common
             .chunks_mut(DMA_MAX_TRANSFER_SIZE)
-            .zip(write.chunks(DMA_MAX_TRANSFER_SIZE))
+            .zip(write_common.chunks(DMA_MAX_TRANSFER_SIZE))
         {
             self.transfer_dma_chunk(read_chunk, write_chunk).await?;
+        }
+
+        if !read_tail.is_empty() {
+            self.info.regs().tcr().modify(|w| {
+                w.set_txmsk(Txmsk::Normal);
+                w.set_rxmsk(Rxmsk::Normal);
+            });
+            for read_chunk in read_tail.chunks_mut(DMA_MAX_TRANSFER_SIZE) {
+                self.read_dma_chunk(read_chunk).await?;
+            }
+        }
+
+        if !write_tail.is_empty() {
+            self.info.regs().tcr().modify(|w| {
+                w.set_txmsk(Txmsk::Normal);
+                w.set_rxmsk(Rxmsk::Mask);
+            });
+            for write_chunk in write_tail.chunks(DMA_MAX_TRANSFER_SIZE) {
+                self.write_dma_chunk(write_chunk).await?;
+            }
         }
 
         on_drop.defuse();
