@@ -236,6 +236,23 @@ impl<'d, M: IoMode> Spi<'d, M> {
 }
 
 impl<'d, M: IoMode> Spi<'d, M> {
+    fn abort_async_transaction(info: &'static Info) {
+        let regs = info.regs();
+
+        regs.ier().write(|w| w.0 = 0);
+        regs.cr().modify(|w| {
+            w.set_men(false);
+            w.set_rtf(Rtf::TxfifoRst);
+            w.set_rrf(Rrf::RxfifoRst);
+        });
+        regs.sr().write(|w| {
+            w.set_ref_(true);
+            w.set_tef(true);
+            w.set_tcf(true);
+        });
+        regs.cr().modify(|w| w.set_men(true));
+    }
+
     fn check_status(&mut self) -> Result<(), IoError> {
         let status = self.info.regs().sr().read();
 
@@ -903,14 +920,32 @@ where
 
     /// Async flush.
     pub async fn async_flush(&mut self) -> Result<(), IoError> {
-        self.info
+        let info = self.info;
+        let on_drop = OnDrop::new(move || Self::abort_async_transaction(info));
+
+        let wait_result = self
+            .info
             .wait_cell()
             .wait_for(|| {
-                self.info.regs().ier().write(|w| w.set_tcie(true));
-                self.info.regs().sr().read().tcf()
+                self.info.regs().ier().write(|w| {
+                    w.set_tcie(true);
+                    w.set_teie(true);
+                    w.set_reie(true);
+                });
+                let status = self.info.regs().sr().read();
+                status.tcf() || status.tef() || status.ref_()
             })
             .await
-            .map_err(|_| IoError::Other)
+            .map_err(|_| IoError::Other);
+
+        match wait_result {
+            Ok(()) => {
+                self.check_status()?;
+                on_drop.defuse();
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -919,6 +954,9 @@ impl<'d> AsyncEngine for Spi<'d, Async> {
         if data.is_empty() {
             return Ok(());
         }
+
+        let info = self.info;
+        let on_drop = OnDrop::new(move || Self::abort_async_transaction(info));
 
         self.info.regs().tcr().modify(|w| {
             w.set_txmsk(Txmsk::Mask);
@@ -946,6 +984,7 @@ impl<'d> AsyncEngine for Spi<'d, Async> {
             *word = self.info.regs().rdr().read().data() as u8;
         }
 
+        on_drop.defuse();
         Ok(())
     }
 
@@ -953,6 +992,9 @@ impl<'d> AsyncEngine for Spi<'d, Async> {
         if data.is_empty() {
             return Ok(());
         }
+
+        let info = self.info;
+        let on_drop = OnDrop::new(move || Self::abort_async_transaction(info));
 
         self.info.regs().tcr().modify(|w| {
             w.set_txmsk(Txmsk::Normal);
@@ -967,8 +1009,10 @@ impl<'d> AsyncEngine for Spi<'d, Async> {
                     self.info.regs().ier().modify(|w| {
                         w.set_tdie(true);
                         w.set_teie(true);
+                        w.set_reie(true);
                     });
-                    self.info.regs().fsr().read().txcount() < LPSPI_FIFO_SIZE || self.info.regs().sr().read().tef()
+                    let status = self.info.regs().sr().read();
+                    self.info.regs().fsr().read().txcount() < LPSPI_FIFO_SIZE || status.tef() || status.ref_()
                 })
                 .await
                 .map_err(|_| IoError::Other)?;
@@ -978,13 +1022,18 @@ impl<'d> AsyncEngine for Spi<'d, Async> {
             self.info.regs().tdr().write(|w| w.set_data(*word as u32));
         }
 
-        self.async_flush().await
+        self.async_flush().await?;
+        on_drop.defuse();
+        Ok(())
     }
 
     async fn async_transfer_internal(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), IoError> {
         if read.is_empty() && write.is_empty() {
             return Ok(());
         }
+
+        let info = self.info;
+        let on_drop = OnDrop::new(move || Self::abort_async_transaction(info));
 
         self.info.regs().tcr().modify(|w| {
             w.set_txmsk(Txmsk::Normal);
@@ -1000,8 +1049,10 @@ impl<'d> AsyncEngine for Spi<'d, Async> {
                     self.info.regs().ier().modify(|w| {
                         w.set_tdie(true);
                         w.set_teie(true);
+                        w.set_reie(true);
                     });
-                    self.info.regs().fsr().read().txcount() < LPSPI_FIFO_SIZE || self.info.regs().sr().read().tef()
+                    let status = self.info.regs().sr().read();
+                    self.info.regs().fsr().read().txcount() < LPSPI_FIFO_SIZE || status.tef() || status.ref_()
                 })
                 .await
                 .map_err(|_| IoError::Other)?;
@@ -1015,8 +1066,10 @@ impl<'d> AsyncEngine for Spi<'d, Async> {
                     self.info.regs().ier().modify(|w| {
                         w.set_rdie(true);
                         w.set_reie(true);
+                        w.set_teie(true);
                     });
-                    self.info.regs().fsr().read().rxcount() > 0 || self.info.regs().sr().read().ref_()
+                    let status = self.info.regs().sr().read();
+                    self.info.regs().fsr().read().rxcount() > 0 || status.ref_() || status.tef()
                 })
                 .await
                 .map_err(|_| IoError::Other)?;
@@ -1024,13 +1077,18 @@ impl<'d> AsyncEngine for Spi<'d, Async> {
             *rb = self.info.regs().rdr().read().data() as u8;
         }
 
-        self.async_flush().await
+        self.async_flush().await?;
+        on_drop.defuse();
+        Ok(())
     }
 
     async fn async_transfer_in_place_internal(&mut self, data: &mut [u8]) -> Result<(), IoError> {
         if data.is_empty() {
             return Ok(());
         }
+
+        let info = self.info;
+        let on_drop = OnDrop::new(move || Self::abort_async_transaction(info));
 
         self.info.regs().tcr().modify(|w| {
             w.set_txmsk(Txmsk::Normal);
@@ -1042,26 +1100,40 @@ impl<'d> AsyncEngine for Spi<'d, Async> {
             self.info
                 .wait_cell()
                 .wait_for(|| {
-                    self.info.regs().ier().modify(|w| w.set_tdie(true));
-                    self.info.regs().fsr().read().txcount() < LPSPI_FIFO_SIZE
+                    self.info.regs().ier().modify(|w| {
+                        w.set_tdie(true);
+                        w.set_teie(true);
+                        w.set_reie(true);
+                    });
+                    let status = self.info.regs().sr().read();
+                    self.info.regs().fsr().read().txcount() < LPSPI_FIFO_SIZE || status.tef() || status.ref_()
                 })
                 .await
                 .map_err(|_| IoError::Other)?;
+            self.check_status()?;
             self.info.regs().tdr().write(|w| w.set_data(*word as u32));
 
             // Wait until we have data in the RxFIFO.
             self.info
                 .wait_cell()
                 .wait_for(|| {
-                    self.info.regs().ier().modify(|w| w.set_rdie(true));
-                    self.info.regs().fsr().read().rxcount() > 0
+                    self.info.regs().ier().modify(|w| {
+                        w.set_rdie(true);
+                        w.set_reie(true);
+                        w.set_teie(true);
+                    });
+                    let status = self.info.regs().sr().read();
+                    self.info.regs().fsr().read().rxcount() > 0 || status.ref_() || status.tef()
                 })
                 .await
                 .map_err(|_| IoError::Other)?;
+            self.check_status()?;
             *word = self.info.regs().rdr().read().data() as u8;
         }
 
-        self.async_flush().await
+        self.async_flush().await?;
+        on_drop.defuse();
+        Ok(())
     }
 }
 
