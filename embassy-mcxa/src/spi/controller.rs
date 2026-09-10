@@ -236,6 +236,11 @@ impl<'d, M: IoMode> Spi<'d, M> {
 }
 
 impl<'d, M: IoMode> Spi<'d, M> {
+    fn transfer_lengths(read_len: usize, write_len: usize) -> (usize, usize, usize) {
+        let common = read_len.min(write_len);
+        (common, read_len - common, write_len - common)
+    }
+
     fn abort_async_transaction(info: &'static Info) {
         let regs = info.regs();
 
@@ -319,6 +324,8 @@ impl<'d, M: IoMode> Spi<'d, M> {
             return Ok(());
         }
 
+        let (common, read_remaining, write_remaining) = Self::transfer_lengths(read.len(), write.len());
+
         self.info.regs().tcr().modify(|w| {
             w.set_txmsk(Txmsk::Normal);
             w.set_rxmsk(Rxmsk::Normal);
@@ -326,7 +333,7 @@ impl<'d, M: IoMode> Spi<'d, M> {
 
         let fifo_size = LPSPI_FIFO_SIZE;
 
-        for (wb, rb) in write.iter().zip(read.iter_mut()) {
+        for (wb, rb) in write.iter().take(common).zip(read.iter_mut().take(common)) {
             // Wait until we have at least one byte space in the TxFIFO.
             while self.info.regs().fsr().read().txcount() - fifo_size == 0 {}
             self.check_status()?;
@@ -336,6 +343,32 @@ impl<'d, M: IoMode> Spi<'d, M> {
             while self.info.regs().fsr().read().rxcount() == 0 {}
             self.check_status()?;
             *rb = self.info.regs().rdr().read().data() as u8;
+        }
+
+        if read_remaining > 0 {
+            self.info.regs().tcr().modify(|w| {
+                w.set_txmsk(Txmsk::Mask);
+                w.set_rxmsk(Rxmsk::Normal);
+            });
+
+            for rb in read.iter_mut().skip(common) {
+                while self.info.regs().fsr().read().rxcount() == 0 {}
+                self.check_status()?;
+                *rb = self.info.regs().rdr().read().data() as u8;
+            }
+        }
+
+        if write_remaining > 0 {
+            self.info.regs().tcr().modify(|w| {
+                w.set_txmsk(Txmsk::Normal);
+                w.set_rxmsk(Rxmsk::Mask);
+            });
+
+            for wb in write.iter().skip(common) {
+                while self.info.regs().fsr().read().txcount() - fifo_size == 0 {}
+                self.check_status()?;
+                self.info.regs().tdr().write(|w| w.set_data(*wb as u32));
+            }
         }
 
         self.blocking_flush()
@@ -1034,14 +1067,14 @@ impl<'d> AsyncEngine for Spi<'d, Async> {
 
         let info = self.info;
         let on_drop = OnDrop::new(move || Self::abort_async_transaction(info));
+        let (common, read_remaining, write_remaining) = Self::transfer_lengths(read.len(), write.len());
 
         self.info.regs().tcr().modify(|w| {
             w.set_txmsk(Txmsk::Normal);
             w.set_rxmsk(Rxmsk::Normal);
         });
 
-        // Zip will terminate whenever the first of write or read are exhausted
-        for (wb, rb) in write.iter().zip(read.iter_mut()) {
+        for (wb, rb) in write.iter().take(common).zip(read.iter_mut().take(common)) {
             // Wait until we have at least one byte space in the TxFIFO.
             self.info
                 .wait_cell()
@@ -1075,6 +1108,56 @@ impl<'d> AsyncEngine for Spi<'d, Async> {
                 .map_err(|_| IoError::Other)?;
             self.check_status()?;
             *rb = self.info.regs().rdr().read().data() as u8;
+        }
+
+        if read_remaining > 0 {
+            self.info.regs().tcr().modify(|w| {
+                w.set_txmsk(Txmsk::Mask);
+                w.set_rxmsk(Rxmsk::Normal);
+            });
+
+            for rb in read.iter_mut().skip(common) {
+                self.info
+                    .wait_cell()
+                    .wait_for(|| {
+                        self.info.regs().ier().modify(|w| {
+                            w.set_rdie(true);
+                            w.set_reie(true);
+                            w.set_teie(true);
+                        });
+                        let status = self.info.regs().sr().read();
+                        self.info.regs().fsr().read().rxcount() > 0 || status.ref_() || status.tef()
+                    })
+                    .await
+                    .map_err(|_| IoError::Other)?;
+                self.check_status()?;
+                *rb = self.info.regs().rdr().read().data() as u8;
+            }
+        }
+
+        if write_remaining > 0 {
+            self.info.regs().tcr().modify(|w| {
+                w.set_txmsk(Txmsk::Normal);
+                w.set_rxmsk(Rxmsk::Mask);
+            });
+
+            for wb in write.iter().skip(common) {
+                self.info
+                    .wait_cell()
+                    .wait_for(|| {
+                        self.info.regs().ier().modify(|w| {
+                            w.set_tdie(true);
+                            w.set_teie(true);
+                            w.set_reie(true);
+                        });
+                        let status = self.info.regs().sr().read();
+                        self.info.regs().fsr().read().txcount() < LPSPI_FIFO_SIZE || status.tef() || status.ref_()
+                    })
+                    .await
+                    .map_err(|_| IoError::Other)?;
+                self.check_status()?;
+                self.info.regs().tdr().write(|w| w.set_data(*wb as u32));
+            }
         }
 
         self.async_flush().await?;
@@ -1358,5 +1441,25 @@ impl<'d, M: IoMode> SetConfig for Spi<'d, M> {
 
     fn set_config(&mut self, config: &Self::Config) -> Result<(), Self::ConfigError> {
         self.set_configuration(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Blocking, Spi};
+
+    #[test]
+    fn transfer_lengths_are_equal() {
+        assert_eq!(Spi::<'static, Blocking>::transfer_lengths(4, 4), (4, 0, 0));
+    }
+
+    #[test]
+    fn transfer_lengths_include_read_tail() {
+        assert_eq!(Spi::<'static, Blocking>::transfer_lengths(4, 1), (1, 3, 0));
+    }
+
+    #[test]
+    fn transfer_lengths_include_write_tail() {
+        assert_eq!(Spi::<'static, Blocking>::transfer_lengths(1, 4), (1, 0, 3));
     }
 }
