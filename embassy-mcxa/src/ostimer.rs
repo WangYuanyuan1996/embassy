@@ -106,6 +106,15 @@ impl OsTimer {
         let alarm = self.alarms.borrow(cs);
         alarm.timestamp.set(timestamp);
 
+        // Disable the interrupt and wait for the previous event to clear before
+        // programming a new match value across the OSTIMER clock domain.
+        OSTIMER0.osevent_ctrl().modify(|w| {
+            w.set_ostimer_intena(false);
+            w.set_ostimer_intrflag(true)
+        });
+        while OSTIMER0.osevent_ctrl().read().ostimer_intrflag() {}
+        interrupt::OS_EVENT.unpend();
+
         // Wait until we're allowed to write to MATCH_L/MATCH_H registers
         while OSTIMER0.osevent_ctrl().read().match_wr_rdy() {}
 
@@ -115,6 +124,9 @@ impl OsTimer {
         OSTIMER0
             .match_h()
             .write(|w| w.set_match_value((gray_timestamp >> 32) as u16));
+
+        // Wait for the new match value to reach the active compare registers.
+        while OSTIMER0.osevent_ctrl().read().match_wr_rdy() {}
 
         // Check if the timestamp has already expired, which could mean the just set match value would never match.
         let t = self.now();
@@ -126,6 +138,15 @@ impl OsTimer {
 
         // Enable interrupt. If the timestamp already matched, this would immediately pend the interrupt.
         OSTIMER0.osevent_ctrl().modify(|w| w.set_ostimer_intena(true));
+
+        // The deadline can pass between the previous check and enabling the
+        // interrupt. Disarm it so the timer queue retries immediately.
+        if timestamp <= self.now() {
+            OSTIMER0.osevent_ctrl().modify(|w| w.set_ostimer_intena(false));
+            alarm.timestamp.set(u64::MAX);
+            return false;
+        }
+
         true
     }
 
@@ -144,6 +165,8 @@ impl OsTimer {
                     w.set_ostimer_intena(false);
                     w.set_ostimer_intrflag(true)
                 });
+                while OSTIMER0.osevent_ctrl().read().ostimer_intrflag() {}
+                interrupt::OS_EVENT.unpend();
                 crate::perf_counters::incr_interrupt_ostimer_alarm();
                 self.trigger_alarm(cs);
             }
@@ -161,9 +184,9 @@ impl Driver for OsTimer {
             return 0;
         }
 
-        let mut t = OSTIMER0.evtimerh().read().0 as u64;
-        t <<= 32;
-        t |= OSTIMER0.evtimerl().read().evtimer_count_value() as u64;
+        let low = OSTIMER0.evtimerl().read().evtimer_count_value() as u64;
+        let high = OSTIMER0.evtimerh().read().0 as u64;
+        let t = low | (high << 32);
         gray_to_dec(t)
     }
 
