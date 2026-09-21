@@ -15,6 +15,8 @@ use crate::interrupt::InterruptExt;
 use crate::pac::OSTIMER0;
 use crate::peripherals::OSTIMER0;
 
+const SYNC_SPIN_LIMIT: usize = 10_000;
+
 struct AlarmState {
     timestamp: Cell<u64>,
 }
@@ -54,6 +56,28 @@ fn gray_to_dec(gray: u64) -> u64 {
 fn dec_to_gray(dec: u64) -> u64 {
     let gray = dec;
     gray ^ (gray >> 1)
+}
+
+fn wait_for_interrupt_flag_clear() -> bool {
+    for _ in 0..SYNC_SPIN_LIMIT {
+        if !OSTIMER0.osevent_ctrl().read().ostimer_intrflag() {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+
+    false
+}
+
+fn wait_for_match_write_complete() -> bool {
+    for _ in 0..SYNC_SPIN_LIMIT {
+        if !OSTIMER0.osevent_ctrl().read().match_wr_rdy() {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+
+    false
 }
 
 embassy_time_driver::time_driver_impl!(static DRIVER: OsTimer = OsTimer {
@@ -112,11 +136,17 @@ impl OsTimer {
             w.set_ostimer_intena(false);
             w.set_ostimer_intrflag(true)
         });
-        while OSTIMER0.osevent_ctrl().read().ostimer_intrflag() {}
+        if !wait_for_interrupt_flag_clear() {
+            #[cfg(feature = "defmt")]
+            defmt::warn!("OSTIMER interrupt flag clear timed out");
+        }
         interrupt::OS_EVENT.unpend();
 
         // Wait until we're allowed to write to MATCH_L/MATCH_H registers
-        while OSTIMER0.osevent_ctrl().read().match_wr_rdy() {}
+        if !wait_for_match_write_complete() {
+            #[cfg(feature = "defmt")]
+            defmt::warn!("OSTIMER match register ready timed out before write");
+        }
 
         let gray_timestamp = dec_to_gray(timestamp);
 
@@ -126,7 +156,10 @@ impl OsTimer {
             .write(|w| w.set_match_value((gray_timestamp >> 32) as u16));
 
         // Wait for the new match value to reach the active compare registers.
-        while OSTIMER0.osevent_ctrl().read().match_wr_rdy() {}
+        if !wait_for_match_write_complete() {
+            #[cfg(feature = "defmt")]
+            defmt::warn!("OSTIMER match register update timed out");
+        }
 
         // Check if the timestamp has already expired, which could mean the just set match value would never match.
         let t = self.now();
@@ -165,7 +198,10 @@ impl OsTimer {
                     w.set_ostimer_intena(false);
                     w.set_ostimer_intrflag(true)
                 });
-                while OSTIMER0.osevent_ctrl().read().ostimer_intrflag() {}
+                if !wait_for_interrupt_flag_clear() {
+                    #[cfg(feature = "defmt")]
+                    defmt::warn!("OSTIMER interrupt flag clear timed out in ISR");
+                }
                 interrupt::OS_EVENT.unpend();
                 crate::perf_counters::incr_interrupt_ostimer_alarm();
                 self.trigger_alarm(cs);
